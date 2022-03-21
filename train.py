@@ -1,21 +1,20 @@
 # coding=utf-8
 from __future__ import absolute_import, division, print_function
 
+from datetime import timedelta
 import logging
 import argparse
 import os
 import random
+
 import numpy as np
-
-from datetime import timedelta
-
 import torch
 import torch.distributed as dist
-
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 from apex import amp
 from apex.parallel import DistributedDataParallel as DDP
+import wandb
 
 from models.modeling import VisionTransformer, CONFIGS
 from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
@@ -23,7 +22,8 @@ from utils.data_utils import get_loader
 from utils.dist_util import get_world_size
 
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(__file__)
+wandb.init(project="ViT-experiments", entity="caerang")
 
 
 class AverageMeter(object):
@@ -58,11 +58,18 @@ def save_model(args, model):
 def setup(args):
     # Prepare model
     config = CONFIGS[args.model_type]
+    
+    num_classes_ = {"cifar10": 10, "cifar100": 100, "tiny-imagenet": 200}
 
-    num_classes = 10 if args.dataset == "cifar10" else 100
+    num_classes = num_classes_[args.dataset]
 
     model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes)
-    model.load_from(np.load(args.pretrained_dir))
+    
+    # None를 참/거짓 비교하고 None는 False
+    if args.pretrained_dir != 'None':
+        # model.load_from(np.load(args.pretrained_dir))
+        model.load_state_dict(torch.load(args.pretrained_dir), strict=False)
+
     model.to(args.device)
     num_params = count_parameters(model)
 
@@ -70,6 +77,9 @@ def setup(args):
     logger.info("Training parameters %s", args)
     logger.info("Total Parameter: \t%2.1fM" % num_params)
     print(num_params)
+    
+    wandb.config = args
+    
     return args, model
 
 
@@ -133,6 +143,8 @@ def valid(args, model, writer, test_loader, global_step):
     logger.info("Global Steps: %d" % global_step)
     logger.info("Valid Loss: %2.5f" % eval_losses.avg)
     logger.info("Valid Accuracy: %2.5f" % accuracy)
+    
+    wandb.log({'valid/accuracy': accuracy, 'valid/loss': eval_losses.avg,  'valid/global_step': global_step})
 
     writer.add_scalar("test/accuracy", scalar_value=accuracy, global_step=global_step)
     return accuracy
@@ -220,6 +232,7 @@ def train(args, model):
                 if args.local_rank in [-1, 0]:
                     writer.add_scalar("train/loss", scalar_value=losses.val, global_step=global_step)
                     writer.add_scalar("train/lr", scalar_value=scheduler.get_lr()[0], global_step=global_step)
+                    wandb.log({'train/loss': losses.val, 'train/lr': scheduler.get_lr()[0], 'train/global_step': global_step})
                 if global_step % args.eval_every == 0 and args.local_rank in [-1, 0]:
                     accuracy = valid(args, model, writer, test_loader, global_step)
                     if best_acc < accuracy:
@@ -244,16 +257,25 @@ def main():
     # Required parameters
     parser.add_argument("--name", required=True,
                         help="Name of this run. Used for monitoring.")
-    parser.add_argument("--dataset", choices=["cifar10", "cifar100"], default="cifar10",
+    parser.add_argument("--dataset", choices=["cifar10", "cifar100", "tiny-imagenet"], default="tiny-imagenet",
                         help="Which downstream task.")
     parser.add_argument("--model_type", choices=["ViT-B_16", "ViT-B_32", "ViT-L_16",
                                                  "ViT-L_32", "ViT-H_14", "R50-ViT-B_16"],
                         default="ViT-B_16",
                         help="Which variant to use.")
-    parser.add_argument("--pretrained_dir", type=str, default="checkpoint/ViT-B_16.npz",
+    parser.add_argument("--pretrained_dir", type=str, default='None',
                         help="Where to search for pretrained ViT models.")
     parser.add_argument("--output_dir", default="output", type=str,
                         help="The output directory where checkpoints will be written.")
+
+    parser.add_argument("--train_anno_file", default="./data/tiny-imagenet-200/train_annotations.txt",
+                        type=str, help="Annotation file for train images")
+    parser.add_argument("--train_img_dir", default="./data/tiny-imagenet-200/train",
+                        type=str, help="image root for training")
+    parser.add_argument("--test_anno_file", default="./data/tiny-imagenet-200/val/val_annotations.txt",
+                        type=str, help="Annotation file for validation images")
+    parser.add_argument("--test_img_dir", default="./data/tiny-imagenet-200/val/images",
+                        type=str, help="image root for validating")
 
     parser.add_argument("--img_size", default=224, type=int,
                         help="Resolution size")
